@@ -22,10 +22,10 @@
 //      peak-to-trough is 1.9778%, and every trail width from 2.0% to 4.0%
 //      gives the identical dev result, so any width in that range is equally
 //      "untuned" on dev; 2.5% is the round middle of it. On the dev window
-//      the stop never fires, so it keeps the full buy-and-hold gain (+$32.33
-//      in the local replay); on stress windows it caps the fall (see
-//      backtest.py's published proxies: time-reversal, return-mirror and a
-//      seeded block-shuffle).
+//      the stop never fires, so it keeps the full buy-and-hold gain (+$33.17
+//      in the local replay, grade-local +$33.165318); on stress windows it caps
+//      the fall (see backtest.py's published proxies: time-reversal,
+//      return-mirror, seeded block-shuffle and a synthetic V-dip).
 //   3. After a stop-out, re-enter only once the close has recovered to 1.5%
 //      above the price the stop sold at, at least 60 bars later, and at most
 //      twice per window. In a sustained fall that never fires and the bot sits
@@ -45,7 +45,7 @@ const SYMBOL = 'CBBTC';
  * Sell when a close falls below 97.5% of the peak close seen while holding.
  * Width chosen on a plateau, not on the dev window's edge: the dev window's
  * realised max peak-to-trough is 1.9778%, and every width from 2.0% to 4.0%
- * gives the identical dev result (+$32.33, 1 trade) — so 2.0% would be tuned
+ * gives the identical dev result (+$33.17, 1 trade) — so 2.0% would be tuned
  * to a knife-edge 2.2 bps above that one window's drawdown. 2.5% is a round
  * value in the middle of the plateau: it bets that a pullback under 2.5% is
  * noise and only a deeper break is a trend change. There is no free asymmetry
@@ -73,6 +73,11 @@ let initialEntryFilled = false;
 let stopouts = 0;
 let stopPrice: bigint | null = null;
 let stopBar = -1;
+/** A stop sell has been sent but not yet confirmed filled (see onBatch). */
+let stopPending = false;
+/** Close and bar index at which the pending stop fired. */
+let triggerClose: bigint | null = null;
+let triggerBar = -1;
 let peak: bigint | null = null;
 /** Closes of CBBTC, one per batch that carried its bar, oldest first. */
 const closes: bigint[] = [];
@@ -92,21 +97,37 @@ await runBars({
     if (held !== undefined) {
       initialEntryFilled = true;
       stopPrice = null;
+      if (stopPending) {
+        // The stop sell sent on an earlier batch was rejected (only a >10%
+        // one-minute gap can reject it at MAX_SLIPPAGE_BPS 1000): re-issue
+        // the full-position sell. The stop-out is NOT counted yet and the
+        // peak is NOT reset — the exit has not happened.
+        return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      }
       peak = peak === null || close > peak ? close : peak;
       if (close * TRAIL_DEN < peak * TRAIL_NUM) {
         // Trailing stop: exit the whole position at this close's decision.
         // The fill lands at the next bar's open, so a gap-down open can realise
         // a loss materially larger than 2.5% + costs; 2.5% is the trigger, not
         // a hard cap on the realised loss.
-        stopouts += 1;
-        stopPrice = close;
-        stopBar = closes.length - 1;
+        stopPending = true;
+        triggerClose = close;
+        triggerBar = closes.length - 1;
         peak = null;
         return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
 
+    // Flat: a pending stop sell has filled (we are no longer holding), so only
+    // now does the stop-out count, with the price and bar that triggered it.
+    if (stopPending) {
+      stopPending = false;
+      stopouts += 1;
+      stopPrice = triggerClose;
+      stopBar = triggerBar;
+      triggerClose = null;
+    }
     peak = null;
     const buyAll = (): BuyInput[] => {
       const room = state.weightRoom(SYMBOL);
@@ -133,7 +154,7 @@ await runBars({
     // later batches while the condition still holds.
     if (
       stopPrice !== null &&
-      stopouts <= MAX_STOPOUTS &&
+      stopouts < MAX_STOPOUTS &&
       closes.length - 1 - stopBar >= REENTRY_COOLDOWN_BARS &&
       close * REENTRY_DEN > stopPrice * REENTRY_NUM
     ) {
